@@ -1,0 +1,16 @@
+[Unit]
+Description=Binance Pump Alert Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/binance_pump_alert_bot
+EnvironmentFile=/opt/binance_pump_alert_bot/.env
+ExecStart=/opt/binance_pump_alert_bot/.venv/bin/python /opt/binance_pump_alert_bot/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
