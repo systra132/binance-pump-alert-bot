@@ -2,7 +2,7 @@
 
 ## フィルター条件
 
-対象は Binance USDⓈ-M Futures の USDT建て無期限先物です。
+対象はBinance USDⓈ-M Futures の USDT建て無期限先物です。
 
 ローソク足：1時間足、確定足のみ
 過去11時間：
