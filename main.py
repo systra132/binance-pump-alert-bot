@@ -286,12 +286,6 @@ def build_discord_message(candidates: list[Candidate], counts: PassCounts) -> st
                 f"{i}. {c.symbol}",
                 f"陽線率: +{c.bullish_pct:.2f}%",
                 f"出来高: {format_usd(c.quote_volume)}",
-                f"終値: {c.latest_close:g}",
-                f"MA5: {c.ma5:g}",
-                f"MA10: {c.ma10:g}",
-                f"MA30: {c.ma30:g}",
-                f"MA50: {c.ma50:g}",
-                f"MA100: {c.ma100:g}",
                 "",
             ]
         )
