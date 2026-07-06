@@ -25,7 +25,7 @@ RUN_BUFFER_SECONDS = int(os.getenv("RUN_BUFFER_SECONDS", "20"))
 
 # 条件
 MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "1000000"))
-MIN_BULLISH_CANDLE_PCT = float(os.getenv("MIN_BULLISH_CANDLE_PCT", "4"))
+MIN_BULLISH_CANDLE_PCT = float(os.getenv("MIN_BULLISH_CANDLE_PCT", "3"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
