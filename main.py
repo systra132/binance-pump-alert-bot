@@ -15,12 +15,12 @@ from dotenv import load_dotenv
 
 # =========================================================
 # Binance Abnormal Move Alert Bot
-# Version: 2.0.0
+# Version: 2.2.0
 # =========================================================
 
 load_dotenv()
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 BASE_URL = os.getenv("BINANCE_FAPI_BASE_URL", "https://fapi.binance.com")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -83,9 +83,17 @@ class Candidate:
 
 @dataclass(frozen=True)
 class MarketSnapshot:
-    # 判定対象となる最新確定1時間足の終了時点に対応するOI。
+    # 判定対象となる最新確定1時間足の終了時点に対応するOI総額。
     oi_notional_usdt: Optional[float]
     oi_timestamp_ms: Optional[int]
+
+    # その1時間前のOI総額。
+    oi_previous_1h_usdt: Optional[float]
+    oi_previous_timestamp_ms: Optional[int]
+
+    # (最新OI / 1時間前OI - 1) * 100
+    oi_change_1h_pct: Optional[float]
+
     # 資金調達率は通知時点で取得できる直近の lastFundingRate。
     funding_rate: Optional[float]
 
@@ -143,6 +151,12 @@ def format_funding_rate(rate: Optional[float]) -> str:
     if rate is None:
         return "取得失敗"
     return f"{rate * 100:+.4f}%"
+
+
+def format_percentage(value: Optional[float]) -> str:
+    if value is None:
+        return "取得失敗"
+    return f"{value:+.2f}%"
 
 
 def load_notification_state() -> set[str]:
@@ -415,28 +429,36 @@ async def fetch_closed_hour_oi(
     session: aiohttp.ClientSession,
     symbol: str,
     close_time_ms: int,
-) -> tuple[Optional[float], Optional[int]]:
+) -> tuple[
+    Optional[float],
+    Optional[int],
+    Optional[float],
+    Optional[int],
+]:
     """
-    判定対象の最新確定1時間足の終了時点に対応するOIを取得する。
+    判定対象の最新確定1時間足の終了時点のOI総額と、
+    その1時間前のOI総額を取得する。
 
     Binance Kline の close_time_ms は通常「次の正時 - 1ms」なので、
     +1ms した時刻を対象1時間足の終了境界として扱う。
 
     /futures/data/openInterestHist の period=1h を使い、
-    sumOpenInterestValue（USDT建てOI）を採用する。
+    sumOpenInterestValue（USDT建てOI総額）を採用する。
 
-    1時間古いデータを誤って採用しないよう、対象境界との時刻差が
-    5分以内のレコードだけを有効とする。データ反映が少し遅れた場合に
-    備えて3回まで短時間リトライする。
+    最新側と1時間前側の両方について、対象境界との時刻差が
+    5分以内のレコードだけを有効とする。
+    どちらか片方しか取得できない場合は古いデータを代用せず、
+    3回まで短時間リトライする。
     """
     target_ms = close_time_ms + 1
+    previous_target_ms = target_ms - 60 * 60 * 1000
     tolerance_ms = 5 * 60 * 1000
 
     params = {
         "symbol": symbol,
         "period": "1h",
-        "limit": 5,
-        "startTime": target_ms - 2 * 60 * 60 * 1000,
+        "limit": 10,
+        "startTime": previous_target_ms - tolerance_ms,
         "endTime": target_ms + tolerance_ms,
     }
 
@@ -448,7 +470,7 @@ async def fetch_closed_hour_oi(
         )
 
         if isinstance(data, list) and data:
-            valid_rows: list[tuple[int, float]] = []
+            rows: list[tuple[int, float]] = []
 
             for row in data:
                 try:
@@ -457,31 +479,51 @@ async def fetch_closed_hour_oi(
                 except (KeyError, TypeError, ValueError):
                     continue
 
-                if abs(timestamp_ms - target_ms) <= tolerance_ms:
-                    valid_rows.append((timestamp_ms, oi_value))
+                rows.append((timestamp_ms, oi_value))
 
-            if valid_rows:
-                # 対象の1時間足終了境界に最も近いOIスナップショットを採用。
-                timestamp_ms, oi_value = min(
-                    valid_rows,
+            current_candidates = [
+                item
+                for item in rows
+                if abs(item[0] - target_ms) <= tolerance_ms
+            ]
+            previous_candidates = [
+                item
+                for item in rows
+                if abs(item[0] - previous_target_ms) <= tolerance_ms
+            ]
+
+            if current_candidates and previous_candidates:
+                current_timestamp_ms, current_oi = min(
+                    current_candidates,
                     key=lambda item: abs(item[0] - target_ms),
                 )
-                return oi_value, timestamp_ms
+                previous_timestamp_ms, previous_oi = min(
+                    previous_candidates,
+                    key=lambda item: abs(item[0] - previous_target_ms),
+                )
+
+                return (
+                    current_oi,
+                    current_timestamp_ms,
+                    previous_oi,
+                    previous_timestamp_ms,
+                )
 
         if data_attempt < 3:
             logger.info(
-                "%s OI history for closed hour not available yet; retry %d/3",
+                "%s OI history pair not available yet; retry %d/3",
                 symbol,
                 data_attempt + 1,
             )
             await asyncio.sleep(2)
 
     logger.warning(
-        "%s no matching 1h OI history near target=%d",
+        "%s no matching 1h OI pair near current=%d previous=%d",
         symbol,
         target_ms,
+        previous_target_ms,
     )
-    return None, None
+    return None, None, None, None
 
 
 async def fetch_market_snapshot(
@@ -493,8 +535,11 @@ async def fetch_market_snapshot(
     条件通過銘柄だけ通知用データを追加取得する。
 
     OI:
-      判定対象の最新確定1時間足の終了時点に対応する
-      1時間OI履歴の sumOpenInterestValue を使用する。
+      判定対象の最新確定1時間足終了時点のOI総額と、
+      その1時間前のOI総額を取得し、1時間OI変化率を算出する。
+
+      OI 1h変化率 =
+          (最新確定足終了時OI / 1時間前OI - 1) * 100
 
     資金調達率:
       /fapi/v1/premiumIndex が返す直近の lastFundingRate を使用する。
@@ -518,6 +563,9 @@ async def fetch_market_snapshot(
 
     oi_notional_usdt: Optional[float] = None
     oi_timestamp_ms: Optional[int] = None
+    oi_previous_1h_usdt: Optional[float] = None
+    oi_previous_timestamp_ms: Optional[int] = None
+    oi_change_1h_pct: Optional[float] = None
     funding_rate: Optional[float] = None
 
     if isinstance(oi_result, Exception):
@@ -527,7 +575,21 @@ async def fetch_market_snapshot(
             oi_result,
         )
     else:
-        oi_notional_usdt, oi_timestamp_ms = oi_result
+        (
+            oi_notional_usdt,
+            oi_timestamp_ms,
+            oi_previous_1h_usdt,
+            oi_previous_timestamp_ms,
+        ) = oi_result
+
+        if (
+            oi_notional_usdt is not None
+            and oi_previous_1h_usdt is not None
+            and oi_previous_1h_usdt > 0
+        ):
+            oi_change_1h_pct = (
+                oi_notional_usdt / oi_previous_1h_usdt - 1.0
+            ) * 100.0
 
     if isinstance(premium_result, Exception):
         logger.warning(
@@ -548,6 +610,9 @@ async def fetch_market_snapshot(
     return MarketSnapshot(
         oi_notional_usdt=oi_notional_usdt,
         oi_timestamp_ms=oi_timestamp_ms,
+        oi_previous_1h_usdt=oi_previous_1h_usdt,
+        oi_previous_timestamp_ms=oi_previous_timestamp_ms,
+        oi_change_1h_pct=oi_change_1h_pct,
         funding_rate=funding_rate,
     )
 
@@ -562,7 +627,8 @@ def build_discord_message(
             "🚨 Binance 異常値動き検出",
             f"**{candidate.symbol}**",
             f"1時間足出来高: {format_usd(candidate.quote_volume)}",
-            f"OI: {format_usd(snapshot.oi_notional_usdt)}",
+            f"OI総額: {format_usd(snapshot.oi_notional_usdt)}",
+            f"OI 1h変化率: {format_percentage(snapshot.oi_change_1h_pct)}",
             f"資金調達率: {format_funding_rate(snapshot.funding_rate)}",
             f"価格上昇率: {candidate.price_rise_pct:+.2f}%",
         ]
@@ -723,6 +789,7 @@ async def scan_once() -> tuple[list[Candidate], PassCounts]:
 
                 if (
                     snapshot.oi_notional_usdt is None
+                    or snapshot.oi_change_1h_pct is None
                     or snapshot.funding_rate is None
                 ):
                     counts.market_data_failed += 1
