@@ -3,10 +3,8 @@ import json
 import logging
 import os
 import signal
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -14,255 +12,332 @@ from dotenv import load_dotenv
 
 
 # =========================================================
-# Binance Abnormal Move Alert Bot
-# Version: 2.2.0
+# Binance Daily Pump Filter Bot
+# Version: 3.0.0
+#
+# 07:30 JST
+#   プレ通知
+#   形成中の日足を、その時点の仮終値・累積出来高として判定
+#   条件一致がなければ通知しない
+#
+# 09:00 JST
+#   本通知
+#   直前に確定した日足で判定
+#   条件一致がなくても「条件一致なし」と通知
+#
+# 判定条件
+#   1. 日足出来高 >= 20M USDT
+#   2. 日足出来高 >= 前日日足出来高 × 2
+#   3. 日足終値 > 直前30本すべての日足終値
+#   4. 日足終値 > SMA5 / 10 / 30 / 50 / 100
+#   5. SMA100を計算できない銘柄は除外
+#
+# 出来高
+#   Binance kline[7] の Quote Asset Volume（USDT建て）
+#
+# MA
+#   判定対象の日足自身を含めて計算
 # =========================================================
+
 
 load_dotenv()
 
-VERSION = "2.2.0"
+VERSION = "3.0.0"
 
-BASE_URL = os.getenv("BINANCE_FAPI_BASE_URL", "https://fapi.binance.com")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-QUOTE_ASSET = os.getenv("QUOTE_ASSET", "USDT")
-
-REQUEST_CONCURRENCY = int(os.getenv("REQUEST_CONCURRENCY", "8"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
-
-# 毎時00分 + 20秒頃に判定する。
-RUN_BUFFER_SECONDS = int(os.getenv("RUN_BUFFER_SECONDS", "20"))
-
-# 今回の異常値動き判定条件。
-# 旧Botの .env に MIN_VOLUME_USD 等が残っていても影響しないよう、
-# 新しい環境変数名を使用する。
-ABNORMAL_MIN_VOLUME_USDT = float(
-    os.getenv("ABNORMAL_MIN_VOLUME_USDT", "10000000")
-)
-ABNORMAL_VOLUME_MULTIPLIER = float(
-    os.getenv("ABNORMAL_VOLUME_MULTIPLIER", "2")
-)
-ABNORMAL_PRICE_RISE_PCT = float(
-    os.getenv("ABNORMAL_PRICE_RISE_PCT", "10")
+BASE_URL = os.getenv(
+    "BINANCE_FAPI_BASE_URL",
+    "https://fapi.binance.com",
 )
 
-# 通知済み銘柄はGit管理ディレクトリ外に保存する。
-# systemd の User=ubuntu でも書き込める場所を Path.home() から作る。
-DEFAULT_STATE_FILE = (
-    Path.home()
-    / ".local"
-    / "state"
-    / "binance-pump-alert-bot"
-    / "notification_state.json"
-)
-STATE_FILE = Path(os.getenv("STATE_FILE", str(DEFAULT_STATE_FILE))).expanduser()
+DISCORD_WEBHOOK_URL = os.getenv(
+    "DISCORD_WEBHOOK_URL",
+    "",
+).strip()
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+QUOTE_ASSET = os.getenv(
+    "QUOTE_ASSET",
+    "USDT",
+)
+
+REQUEST_CONCURRENCY = int(
+    os.getenv("REQUEST_CONCURRENCY", "8")
+)
+
+REQUEST_TIMEOUT = int(
+    os.getenv("REQUEST_TIMEOUT", "20")
+)
+
+REQUEST_RETRIES = int(
+    os.getenv("REQUEST_RETRIES", "3")
+)
+
+# 7:30 / 9:00 ちょうどではなく、
+# デフォルトでは20秒後に実行する。
+#
+# 例:
+#   07:30:20 JST
+#   09:00:20 JST
+#
+# 9時の確定直後にBinance側のデータ反映を
+# 安全に取得するための余裕。
+DAILY_RUN_BUFFER_SECONDS = int(
+    os.getenv("DAILY_RUN_BUFFER_SECONDS", "20")
+)
+
+
+# =========================================================
+# 判定条件
+# =========================================================
+
+MIN_DAILY_VOLUME_USDT = float(
+    os.getenv(
+        "DAILY_MIN_VOLUME_USDT",
+        "20000000",
+    )
+)
+
+VOLUME_MULTIPLIER = float(
+    os.getenv(
+        "DAILY_VOLUME_MULTIPLIER",
+        "2",
+    )
+)
+
+MA_PERIODS = (5, 10, 30, 50, 100)
+
+RECENT_HIGH_PERIOD = 30
+
+KLINE_LIMIT = 105
+
+
+# =========================================================
+# Logging
+# =========================================================
+
+LOG_LEVEL = os.getenv(
+    "LOG_LEVEL",
+    "INFO",
+).upper()
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    ),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("binance-abnormal-move-alert")
 
-JST = timezone(timedelta(hours=9))
+logger = logging.getLogger(
+    "binance-daily-pump-filter"
+)
+
+
+# =========================================================
+# Timezone
+# =========================================================
+
+JST = timezone(
+    timedelta(hours=9)
+)
+
 shutdown_event = asyncio.Event()
 
+
+# =========================================================
+# Data classes
+# =========================================================
 
 @dataclass(frozen=True)
 class Candidate:
     symbol: str
     quote_volume: float
-    avg_quote_volume_24: float
+    close: float
+    previous_quote_volume: float
     volume_multiple: float
-    price_rise_pct: float
-    latest_open: float
-    latest_close: float
+    open_time_ms: int
     close_time_ms: int
-
-
-@dataclass(frozen=True)
-class MarketSnapshot:
-    # 判定対象となる最新確定1時間足の終了時点に対応するOI総額。
-    oi_notional_usdt: Optional[float]
-    oi_timestamp_ms: Optional[int]
-
-    # その1時間前のOI総額。
-    oi_previous_1h_usdt: Optional[float]
-    oi_previous_timestamp_ms: Optional[int]
-
-    # (最新OI / 1時間前OI - 1) * 100
-    oi_change_1h_pct: Optional[float]
-
-    # 資金調達率は通知時点で取得できる直近の lastFundingRate。
-    funding_rate: Optional[float]
 
 
 @dataclass
 class PassCounts:
     total_symbols: int = 0
-    enough_closed_klines: int = 0
-    bullish: int = 0
-    volume_10m: int = 0
-    volume_2x: int = 0
-    price_rise_10pct: int = 0
-    highest_close_24: int = 0
-    final_pass: int = 0
-    already_notified: int = 0
-    kline_failed: int = 0
-    market_data_failed: int = 0
-    discord_failed: int = 0
 
+    enough_klines: int = 0
+
+    volume_20m: int = 0
+
+    volume_2x: int = 0
+
+    highest_close_30: int = 0
+
+    above_all_ma: int = 0
+
+    final_pass: int = 0
+
+    kline_failed: int = 0
+
+
+# =========================================================
+# Time helpers
+# =========================================================
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(
+        timezone.utc
+    )
 
 
 def jst_now() -> datetime:
-    return utc_now().astimezone(JST)
+    return utc_now().astimezone(
+        JST
+    )
 
 
-def notification_day_key(now: Optional[datetime] = None) -> str:
-    """
-    JST 09:00 を1日の起点とする。
+# =========================================================
+# Formatting
+# =========================================================
 
-    例:
-      2026-08-26 08:59 JST -> 2026-08-25
-      2026-08-26 09:00 JST -> 2026-08-26
-    """
-    current = now or jst_now()
-    shifted = current - timedelta(hours=9)
-    return shifted.date().isoformat()
+def format_volume(
+    value: float,
+) -> str:
 
-
-def format_usd(value: Optional[float]) -> str:
-    if value is None:
-        return "取得失敗"
     if value >= 1_000_000_000:
-        return f"${value / 1_000_000_000:.2f}B"
+        return (
+            f"${value / 1_000_000_000:.2f}B"
+        )
+
     if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
+        return (
+            f"${value / 1_000_000:.2f}M"
+        )
+
     if value >= 1_000:
-        return f"${value / 1_000:.2f}K"
+        return (
+            f"${value / 1_000:.2f}K"
+        )
+
     return f"${value:.2f}"
 
 
-def format_funding_rate(rate: Optional[float]) -> str:
-    if rate is None:
-        return "取得失敗"
-    return f"{rate * 100:+.4f}%"
-
-
-def format_percentage(value: Optional[float]) -> str:
-    if value is None:
-        return "取得失敗"
-    return f"{value:+.2f}%"
-
-
-def load_notification_state() -> set[str]:
-    current_key = notification_day_key()
-
-    if not STATE_FILE.exists():
-        return set()
-
-    try:
-        with STATE_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if data.get("notification_day") != current_key:
-            logger.info(
-                "notification day changed: old=%s new=%s",
-                data.get("notification_day"),
-                current_key,
-            )
-            return set()
-
-        symbols = data.get("symbols", [])
-        if not isinstance(symbols, list):
-            raise ValueError("state symbols is not a list")
-
-        return {str(symbol) for symbol in symbols}
-
-    except Exception as exc:
-        logger.warning("failed to load state file %s: %s", STATE_FILE, exc)
-        return set()
-
-
-def save_notification_state(notified_symbols: set[str]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    data = {
-        "notification_day": notification_day_key(),
-        "symbols": sorted(notified_symbols),
-        "updated_at_jst": jst_now().isoformat(),
-    }
-
-    temp_file = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
-
-    with temp_file.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-
-    os.replace(temp_file, STATE_FILE)
-
+# =========================================================
+# HTTP
+# =========================================================
 
 async def request_json(
     session: aiohttp.ClientSession,
     path: str,
-    params: Optional[dict[str, Any]] = None,
+    params: Optional[
+        dict[str, Any]
+    ] = None,
 ) -> Any:
-    url = BASE_URL + path
-    last_error: Optional[Exception] = None
 
-    for attempt in range(1, REQUEST_RETRIES + 1):
+    url = BASE_URL + path
+
+    last_error: Optional[
+        Exception
+    ] = None
+
+    for attempt in range(
+        1,
+        REQUEST_RETRIES + 1,
+    ):
+
         try:
             async with session.get(
                 url,
                 params=params,
                 timeout=REQUEST_TIMEOUT,
             ) as response:
-                text = await response.text()
+
+                text = (
+                    await response.text()
+                )
 
                 if response.status == 200:
-                    return json.loads(text)
+                    return json.loads(
+                        text
+                    )
 
                 error = RuntimeError(
-                    f"{path} params={params} error=HTTP {response.status}: "
+                    f"{path} "
+                    f"params={params} "
+                    f"HTTP {response.status}: "
                     f"{text[:300]}"
                 )
 
-                if response.status == 429 or response.status >= 500:
-                    last_error = error
-                    retry_after = response.headers.get("Retry-After")
+                last_error = error
+
+                if (
+                    response.status == 429
+                    or response.status >= 500
+                ):
+
+                    retry_after = (
+                        response.headers.get(
+                            "Retry-After"
+                        )
+                    )
+
                     if retry_after:
                         try:
-                            wait_seconds = max(float(retry_after), 1.0)
+                            wait_seconds = max(
+                                float(
+                                    retry_after
+                                ),
+                                1.0,
+                            )
                         except ValueError:
-                            wait_seconds = float(attempt)
+                            wait_seconds = float(
+                                attempt
+                            )
                     else:
-                        wait_seconds = float(attempt)
+                        wait_seconds = float(
+                            attempt
+                        )
 
                     logger.warning(
-                        "request retry %d/%d: %s; wait=%.1fs",
+                        "request retry "
+                        "%d/%d: %s; "
+                        "wait=%.1fs",
                         attempt,
                         REQUEST_RETRIES,
                         error,
                         wait_seconds,
                     )
-                    await asyncio.sleep(wait_seconds)
+
+                    await asyncio.sleep(
+                        wait_seconds
+                    )
+
                     continue
 
                 raise error
 
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            json.JSONDecodeError,
+        ) as exc:
+
             last_error = exc
-            if attempt >= REQUEST_RETRIES:
+
+            if (
+                attempt
+                >= REQUEST_RETRIES
+            ):
                 break
 
-            wait_seconds = float(attempt)
+            wait_seconds = float(
+                attempt
+            )
+
             logger.warning(
-                "request retry %d/%d: %s params=%s error=%s; wait=%.1fs",
+                "request retry "
+                "%d/%d: "
+                "%s params=%s "
+                "error=%s; "
+                "wait=%.1fs",
                 attempt,
                 REQUEST_RETRIES,
                 path,
@@ -270,647 +345,1110 @@ async def request_json(
                 exc,
                 wait_seconds,
             )
-            await asyncio.sleep(wait_seconds)
+
+            await asyncio.sleep(
+                wait_seconds
+            )
 
     raise RuntimeError(
-        f"request failed after {REQUEST_RETRIES} attempts: {path} params={params}: "
+        "request failed after "
+        f"{REQUEST_RETRIES} attempts: "
+        f"{path} params={params}: "
         f"{last_error}"
     )
 
 
-async def fetch_symbols(session: aiohttp.ClientSession) -> list[str]:
-    data = await request_json(session, "/fapi/v1/exchangeInfo")
+# =========================================================
+# Binance symbols
+# =========================================================
+
+async def fetch_symbols(
+    session: aiohttp.ClientSession,
+) -> list[str]:
+
+    data = await request_json(
+        session,
+        "/fapi/v1/exchangeInfo",
+    )
+
     symbols: list[str] = []
 
-    for item in data.get("symbols", []):
+    for item in data.get(
+        "symbols",
+        [],
+    ):
+
         if (
-            item.get("contractType") == "PERPETUAL"
-            and item.get("quoteAsset") == QUOTE_ASSET
-            and item.get("status") == "TRADING"
+            item.get("contractType")
+            == "PERPETUAL"
+            and item.get("quoteAsset")
+            == QUOTE_ASSET
+            and item.get("status")
+            == "TRADING"
         ):
-            symbols.append(item["symbol"])
 
-    return sorted(symbols)
+            symbol = item.get(
+                "symbol"
+            )
+
+            if symbol:
+                symbols.append(
+                    symbol
+                )
+
+    return sorted(
+        symbols
+    )
 
 
-def parse_closed_klines(raw_klines: list[list[Any]]) -> list[list[Any]]:
-    """
-    Binance kline の close time が現在時刻より前の足だけ残す。
-    形成中の未確定1時間足はここで完全に除外する。
-    """
-    now_ms = int(time.time() * 1000)
-    return [kline for kline in raw_klines if int(kline[6]) < now_ms]
+# =========================================================
+# Daily klines
+# =========================================================
 
-
-async def fetch_klines(
+async def fetch_daily_klines(
     session: aiohttp.ClientSession,
     symbol: str,
 ) -> list[list[Any]]:
-    # 必要なのは「判定対象の最新確定足 + その直前24本」。
-    # APIレスポンスに未確定足が1本含まれても足りるよう26本取得する。
-    raw = await request_json(
+
+    data = await request_json(
         session,
         "/fapi/v1/klines",
         {
             "symbol": symbol,
-            "interval": "1h",
-            "limit": 26,
+            "interval": "1d",
+            "limit": KLINE_LIMIT,
         },
     )
-    return parse_closed_klines(raw)
 
+    if not isinstance(
+        data,
+        list,
+    ):
+        raise RuntimeError(
+            f"{symbol}: "
+            "invalid kline response"
+        )
+
+    return data
+
+
+# =========================================================
+# Select target candle
+# =========================================================
+
+def select_pre_klines(
+    klines: list[list[Any]],
+) -> list[list[Any]]:
+    """
+    07:30 JST プレ通知用。
+
+    Binanceの日足は
+    UTC 00:00 = JST 09:00
+    で開始する。
+
+    07:30時点では最後の1本が
+    まだ形成中なので、それを
+    判定対象に含める。
+
+    終値:
+        07:30時点の現在値相当
+
+    出来高:
+        07:30時点までの
+        当日日足累積Quote Volume
+    """
+
+    if not klines:
+        return []
+
+    now_ms = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp() * 1000
+    )
+
+    latest = klines[-1]
+
+    # 最後の足が本当に未確定か確認。
+    #
+    # kline[6] = close time
+    if int(latest[6]) < now_ms:
+        logger.warning(
+            "pre scan: latest kline "
+            "is already closed"
+        )
+        return []
+
+    return klines
+
+
+def select_main_klines(
+    klines: list[list[Any]],
+) -> list[list[Any]]:
+    """
+    09:00 JST 本通知用。
+
+    現在時刻よりclose timeが
+    前にある確定日足のみを残す。
+
+    09:00を過ぎるとBinance APIには
+    新しい形成中の日足が含まれるため、
+    それを除外する。
+    """
+
+    now_ms = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp() * 1000
+    )
+
+    closed = [
+        kline
+        for kline in klines
+        if int(kline[6]) < now_ms
+    ]
+
+    return closed
+
+
+# =========================================================
+# Moving average
+# =========================================================
+
+def sma(
+    values: list[float],
+    period: int,
+) -> Optional[float]:
+
+    if len(values) < period:
+        return None
+
+    return (
+        sum(
+            values[-period:]
+        )
+        / period
+    )
+
+
+# =========================================================
+# Symbol evaluation
+# =========================================================
 
 def evaluate_symbol(
     symbol: str,
     klines: list[list[Any]],
+    mode: str,
     counts: PassCounts,
 ) -> Optional[Candidate]:
-    # 最新確定足1本 + その直前24本 = 最低25本必要。
-    if len(klines) < 25:
+
+    if mode == "pre":
+        usable = select_pre_klines(
+            klines
+        )
+
+    elif mode == "main":
+        usable = select_main_klines(
+            klines
+        )
+
+    else:
+        raise ValueError(
+            f"invalid mode: {mode}"
+        )
+
+    # -----------------------------------------------------
+    # SMA100を作るため、
+    # 判定対象の日足を含めて最低100本必要。
+    #
+    # 新規上場等で100本未満なら除外。
+    # -----------------------------------------------------
+
+    if len(usable) < 100:
         return None
 
-    counts.enough_closed_klines += 1
+    counts.enough_klines += 1
 
-    latest = klines[-1]
-    previous_24 = klines[-25:-1]
+    target = usable[-1]
+    previous = usable[-2]
 
-    latest_open = float(latest[1])
-    latest_close = float(latest[4])
-    latest_quote_volume = float(latest[7])
-    close_time_ms = int(latest[6])
+    target_close = float(
+        target[4]
+    )
 
-    if latest_open <= 0:
+    target_quote_volume = float(
+        target[7]
+    )
+
+    previous_quote_volume = float(
+        previous[7]
+    )
+
+    if (
+        target_close <= 0
+        or previous_quote_volume <= 0
+    ):
         return None
 
-    # ---------------------------------------------------------
-    # 条件1: 陽線
-    # ---------------------------------------------------------
-    if latest_close <= latest_open:
-        return None
-    counts.bullish += 1
 
-    # ---------------------------------------------------------
-    # 条件2: 最新確定1時間足の出来高が10M USDT以上
-    # kline[7] = Quote asset volume (USDT建て出来高)
-    # ---------------------------------------------------------
-    if latest_quote_volume < ABNORMAL_MIN_VOLUME_USDT:
-        return None
-    counts.volume_10m += 1
+    # -----------------------------------------------------
+    # 条件1
+    #
+    # 対象日足のUSDT建て出来高
+    # >= 20,000,000 USDT
+    # -----------------------------------------------------
 
-    # ---------------------------------------------------------
-    # 条件3: 最新確定足の出来高が、
-    #         「その直前24本の確定足平均」の2倍以上
-    # 判定対象の最新確定足自身は平均に含めない。
-    # 形成中の未確定足も parse_closed_klines で除外済み。
-    # ---------------------------------------------------------
-    previous_24_volumes = [float(kline[7]) for kline in previous_24]
-    avg_quote_volume_24 = sum(previous_24_volumes) / 24.0
-
-    if avg_quote_volume_24 <= 0:
+    if (
+        target_quote_volume
+        < MIN_DAILY_VOLUME_USDT
+    ):
         return None
 
-    volume_multiple = latest_quote_volume / avg_quote_volume_24
+    counts.volume_20m += 1
 
-    if volume_multiple < ABNORMAL_VOLUME_MULTIPLIER:
+
+    # -----------------------------------------------------
+    # 条件2
+    #
+    # 対象日足出来高
+    # >= 前日日足出来高 × 2
+    # -----------------------------------------------------
+
+    volume_multiple = (
+        target_quote_volume
+        / previous_quote_volume
+    )
+
+    if (
+        volume_multiple
+        < VOLUME_MULTIPLIER
+    ):
         return None
+
     counts.volume_2x += 1
 
-    # ---------------------------------------------------------
-    # 条件4: 最新確定1時間足が、始値→終値で+10%以上上昇
-    # ---------------------------------------------------------
-    price_rise_pct = (latest_close / latest_open - 1.0) * 100.0
 
-    if price_rise_pct < ABNORMAL_PRICE_RISE_PCT:
+    # -----------------------------------------------------
+    # 条件3
+    #
+    # 対象日足の終値が、
+    # 「対象日足を除いた直前30本」
+    # すべての終値より高い。
+    #
+    # つまり、
+    #
+    # target_close
+    # > max(previous 30 closes)
+    #
+    # 同値は通過しない。
+    # -----------------------------------------------------
+
+    previous_30 = (
+        usable[
+            -(RECENT_HIGH_PERIOD + 1):-1
+        ]
+    )
+
+    if (
+        len(previous_30)
+        < RECENT_HIGH_PERIOD
+    ):
         return None
-    counts.price_rise_10pct += 1
 
-    # ---------------------------------------------------------
-    # 条件5: 最新確定足の終値が、直近24本の確定足終値で最高
-    # 「直近24本」には判定対象の最新確定足を含める。
-    # ---------------------------------------------------------
-    recent_24_closes = [float(kline[4]) for kline in klines[-24:]]
+    previous_30_closes = [
+        float(kline[4])
+        for kline in previous_30
+    ]
 
-    if latest_close < max(recent_24_closes):
+    if (
+        target_close
+        <= max(
+            previous_30_closes
+        )
+    ):
         return None
-    counts.highest_close_24 += 1
+
+    counts.highest_close_30 += 1
+
+
+    # -----------------------------------------------------
+    # 条件4
+    #
+    # 対象日足終値が
+    #
+    # SMA5
+    # SMA10
+    # SMA30
+    # SMA50
+    # SMA100
+    #
+    # のすべてより上。
+    #
+    # MA計算には対象日足自身を含む。
+    #
+    # プレ通知では、
+    # 07:30時点の仮終値を使って
+    # 当日日足をMA計算に含める。
+    # -----------------------------------------------------
+
+    closes = [
+        float(kline[4])
+        for kline in usable
+    ]
+
+    moving_averages: list[
+        float
+    ] = []
+
+    for period in MA_PERIODS:
+
+        value = sma(
+            closes,
+            period,
+        )
+
+        if value is None:
+            return None
+
+        moving_averages.append(
+            value
+        )
+
+    if not all(
+        target_close > ma
+        for ma in moving_averages
+    ):
+        return None
+
+    counts.above_all_ma += 1
 
     counts.final_pass += 1
 
     return Candidate(
         symbol=symbol,
-        quote_volume=latest_quote_volume,
-        avg_quote_volume_24=avg_quote_volume_24,
+        quote_volume=target_quote_volume,
+        close=target_close,
+        previous_quote_volume=previous_quote_volume,
         volume_multiple=volume_multiple,
-        price_rise_pct=price_rise_pct,
-        latest_open=latest_open,
-        latest_close=latest_close,
-        close_time_ms=close_time_ms,
+        open_time_ms=int(
+            target[0]
+        ),
+        close_time_ms=int(
+            target[6]
+        ),
     )
 
+
+# =========================================================
+# Concurrent evaluation
+# =========================================================
 
 async def evaluate_one_symbol(
     session: aiohttp.ClientSession,
-    sem: asyncio.Semaphore,
+    semaphore: asyncio.Semaphore,
     symbol: str,
+    mode: str,
     counts: PassCounts,
 ) -> Optional[Candidate]:
-    async with sem:
+
+    async with semaphore:
+
         try:
-            klines = await fetch_klines(session, symbol)
-        except Exception as exc:
-            counts.kline_failed += 1
-            logger.warning("%s skipped: kline request failed: %s", symbol, exc)
-            return None
-
-    return evaluate_symbol(symbol, klines, counts)
-
-
-async def fetch_closed_hour_oi(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    close_time_ms: int,
-) -> tuple[
-    Optional[float],
-    Optional[int],
-    Optional[float],
-    Optional[int],
-]:
-    """
-    判定対象の最新確定1時間足の終了時点のOI総額と、
-    その1時間前のOI総額を取得する。
-
-    Binance Kline の close_time_ms は通常「次の正時 - 1ms」なので、
-    +1ms した時刻を対象1時間足の終了境界として扱う。
-
-    /futures/data/openInterestHist の period=1h を使い、
-    sumOpenInterestValue（USDT建てOI総額）を採用する。
-
-    最新側と1時間前側の両方について、対象境界との時刻差が
-    5分以内のレコードだけを有効とする。
-    どちらか片方しか取得できない場合は古いデータを代用せず、
-    3回まで短時間リトライする。
-    """
-    target_ms = close_time_ms + 1
-    previous_target_ms = target_ms - 60 * 60 * 1000
-    tolerance_ms = 5 * 60 * 1000
-
-    params = {
-        "symbol": symbol,
-        "period": "1h",
-        "limit": 10,
-        "startTime": previous_target_ms - tolerance_ms,
-        "endTime": target_ms + tolerance_ms,
-    }
-
-    for data_attempt in range(1, 4):
-        data = await request_json(
-            session,
-            "/futures/data/openInterestHist",
-            params,
-        )
-
-        if isinstance(data, list) and data:
-            rows: list[tuple[int, float]] = []
-
-            for row in data:
-                try:
-                    timestamp_ms = int(row["timestamp"])
-                    oi_value = float(row["sumOpenInterestValue"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-
-                rows.append((timestamp_ms, oi_value))
-
-            current_candidates = [
-                item
-                for item in rows
-                if abs(item[0] - target_ms) <= tolerance_ms
-            ]
-            previous_candidates = [
-                item
-                for item in rows
-                if abs(item[0] - previous_target_ms) <= tolerance_ms
-            ]
-
-            if current_candidates and previous_candidates:
-                current_timestamp_ms, current_oi = min(
-                    current_candidates,
-                    key=lambda item: abs(item[0] - target_ms),
+            klines = (
+                await fetch_daily_klines(
+                    session,
+                    symbol,
                 )
-                previous_timestamp_ms, previous_oi = min(
-                    previous_candidates,
-                    key=lambda item: abs(item[0] - previous_target_ms),
-                )
-
-                return (
-                    current_oi,
-                    current_timestamp_ms,
-                    previous_oi,
-                    previous_timestamp_ms,
-                )
-
-        if data_attempt < 3:
-            logger.info(
-                "%s OI history pair not available yet; retry %d/3",
-                symbol,
-                data_attempt + 1,
             )
-            await asyncio.sleep(2)
 
-    logger.warning(
-        "%s no matching 1h OI pair near current=%d previous=%d",
-        symbol,
-        target_ms,
-        previous_target_ms,
-    )
-    return None, None, None, None
+        except Exception as exc:
 
+            counts.kline_failed += 1
 
-async def fetch_market_snapshot(
-    session: aiohttp.ClientSession,
-    symbol: str,
-    close_time_ms: int,
-) -> MarketSnapshot:
-    """
-    条件通過銘柄だけ通知用データを追加取得する。
-
-    OI:
-      判定対象の最新確定1時間足終了時点のOI総額と、
-      その1時間前のOI総額を取得し、1時間OI変化率を算出する。
-
-      OI 1h変化率 =
-          (最新確定足終了時OI / 1時間前OI - 1) * 100
-
-    資金調達率:
-      /fapi/v1/premiumIndex が返す直近の lastFundingRate を使用する。
-    """
-    oi_task = fetch_closed_hour_oi(
-        session,
-        symbol,
-        close_time_ms,
-    )
-    premium_task = request_json(
-        session,
-        "/fapi/v1/premiumIndex",
-        {"symbol": symbol},
-    )
-
-    oi_result, premium_result = await asyncio.gather(
-        oi_task,
-        premium_task,
-        return_exceptions=True,
-    )
-
-    oi_notional_usdt: Optional[float] = None
-    oi_timestamp_ms: Optional[int] = None
-    oi_previous_1h_usdt: Optional[float] = None
-    oi_previous_timestamp_ms: Optional[int] = None
-    oi_change_1h_pct: Optional[float] = None
-    funding_rate: Optional[float] = None
-
-    if isinstance(oi_result, Exception):
-        logger.warning(
-            "%s closed-hour OI fetch failed: %s",
-            symbol,
-            oi_result,
-        )
-    else:
-        (
-            oi_notional_usdt,
-            oi_timestamp_ms,
-            oi_previous_1h_usdt,
-            oi_previous_timestamp_ms,
-        ) = oi_result
-
-        if (
-            oi_notional_usdt is not None
-            and oi_previous_1h_usdt is not None
-            and oi_previous_1h_usdt > 0
-        ):
-            oi_change_1h_pct = (
-                oi_notional_usdt / oi_previous_1h_usdt - 1.0
-            ) * 100.0
-
-    if isinstance(premium_result, Exception):
-        logger.warning(
-            "%s premiumIndex fetch failed: %s",
-            symbol,
-            premium_result,
-        )
-    else:
-        try:
-            funding_rate = float(premium_result["lastFundingRate"])
-        except (KeyError, TypeError, ValueError) as exc:
             logger.warning(
-                "%s invalid lastFundingRate response: %s",
+                "%s skipped: "
+                "daily kline request "
+                "failed: %s",
                 symbol,
                 exc,
             )
 
-    return MarketSnapshot(
-        oi_notional_usdt=oi_notional_usdt,
-        oi_timestamp_ms=oi_timestamp_ms,
-        oi_previous_1h_usdt=oi_previous_1h_usdt,
-        oi_previous_timestamp_ms=oi_previous_timestamp_ms,
-        oi_change_1h_pct=oi_change_1h_pct,
-        funding_rate=funding_rate,
-    )
+            return None
+
+    try:
+        return evaluate_symbol(
+            symbol,
+            klines,
+            mode,
+            counts,
+        )
+
+    except (
+        TypeError,
+        ValueError,
+        IndexError,
+    ) as exc:
+
+        logger.warning(
+            "%s skipped: "
+            "invalid kline data: %s",
+            symbol,
+            exc,
+        )
+
+        return None
 
 
-def build_discord_message(
-    candidate: Candidate,
-    snapshot: MarketSnapshot,
-) -> str:
-    # ユーザー指定の通知内容だけを簡潔に表示する。
-    return "\n".join(
-        [
-            "🚨 Binance 異常値動き検出",
-            f"**{candidate.symbol}**",
-            f"1時間足出来高: {format_usd(candidate.quote_volume)}",
-            f"OI総額: {format_usd(snapshot.oi_notional_usdt)}",
-            f"OI 1h変化率: {format_percentage(snapshot.oi_change_1h_pct)}",
-            f"資金調達率: {format_funding_rate(snapshot.funding_rate)}",
-            f"価格上昇率: {candidate.price_rise_pct:+.2f}%",
-        ]
-    )
-
+# =========================================================
+# Discord
+# =========================================================
 
 async def send_discord(
     session: aiohttp.ClientSession,
     message: str,
 ) -> None:
+
     if not DISCORD_WEBHOOK_URL:
-        raise RuntimeError("DISCORD_WEBHOOK_URL is empty")
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL is empty"
+        )
 
-    last_error: Optional[Exception] = None
+    last_error: Optional[
+        Exception
+    ] = None
 
-    for attempt in range(1, REQUEST_RETRIES + 1):
+    for attempt in range(
+        1,
+        REQUEST_RETRIES + 1,
+    ):
+
         try:
             async with session.post(
                 DISCORD_WEBHOOK_URL,
-                json={"content": message},
+                json={
+                    "content": message
+                },
                 timeout=REQUEST_TIMEOUT,
             ) as response:
-                text = await response.text()
+
+                text = (
+                    await response.text()
+                )
 
                 if response.status < 300:
                     return
 
                 error = RuntimeError(
-                    f"Discord error=HTTP {response.status}: {text[:300]}"
+                    "Discord "
+                    f"HTTP {response.status}: "
+                    f"{text[:300]}"
                 )
+
                 last_error = error
 
-                if response.status == 429 or response.status >= 500:
-                    wait_seconds = float(attempt)
+                if (
+                    response.status == 429
+                    or response.status >= 500
+                ):
 
-                    if response.status == 429:
+                    wait_seconds = float(
+                        attempt
+                    )
+
+                    if (
+                        response.status
+                        == 429
+                    ):
+
                         try:
-                            body = json.loads(text)
+                            body = json.loads(
+                                text
+                            )
+
                             wait_seconds = max(
-                                float(body.get("retry_after", wait_seconds)),
+                                float(
+                                    body.get(
+                                        "retry_after",
+                                        wait_seconds,
+                                    )
+                                ),
                                 1.0,
                             )
-                        except (json.JSONDecodeError, TypeError, ValueError):
+
+                        except (
+                            json.JSONDecodeError,
+                            TypeError,
+                            ValueError,
+                        ):
                             pass
 
                     logger.warning(
-                        "Discord retry %d/%d: %s; wait=%.1fs",
+                        "Discord retry "
+                        "%d/%d; wait=%.1fs",
                         attempt,
                         REQUEST_RETRIES,
-                        error,
                         wait_seconds,
                     )
-                    await asyncio.sleep(wait_seconds)
+
+                    await asyncio.sleep(
+                        wait_seconds
+                    )
+
                     continue
 
                 raise error
 
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        ) as exc:
+
             last_error = exc
-            if attempt >= REQUEST_RETRIES:
+
+            if (
+                attempt
+                >= REQUEST_RETRIES
+            ):
                 break
 
-            wait_seconds = float(attempt)
-            logger.warning(
-                "Discord retry %d/%d: %s; wait=%.1fs",
-                attempt,
-                REQUEST_RETRIES,
-                exc,
-                wait_seconds,
+            wait_seconds = float(
+                attempt
             )
-            await asyncio.sleep(wait_seconds)
+
+            await asyncio.sleep(
+                wait_seconds
+            )
 
     raise RuntimeError(
-        f"Discord notification failed after {REQUEST_RETRIES} attempts: {last_error}"
+        "Discord notification "
+        "failed after "
+        f"{REQUEST_RETRIES} attempts: "
+        f"{last_error}"
     )
 
 
-async def scan_once() -> tuple[list[Candidate], PassCounts]:
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT + 10)
+# =========================================================
+# Discord message
+# =========================================================
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        symbols = await fetch_symbols(session)
-        counts = PassCounts(total_symbols=len(symbols))
-        notified_symbols = load_notification_state()
-        state_day = notification_day_key()
+def build_message_chunks(
+    candidates: list[Candidate],
+    mode: str,
+    scan_time: datetime,
+) -> list[str]:
 
-        logger.info(
-            "scan start: version=%s symbols=%d notification_day=%s already_notified=%d",
-            VERSION,
-            len(symbols),
-            notification_day_key(),
-            len(notified_symbols),
+    if mode == "pre":
+        title = (
+            "🟡【プレ通知】日足PUMP候補"
         )
 
-        sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
+    else:
+        title = (
+            "🔴【本通知】日足PUMP候補"
+        )
+
+    header = "\n".join(
+        [
+            title,
+            scan_time.strftime(
+                "%Y/%m/%d %H:%M JST"
+            ),
+            "",
+        ]
+    )
+
+    # 本通知のみ、
+    # 一致0件でも通知する。
+    if not candidates:
+
+        if mode == "main":
+            return [
+                header
+                + "条件一致なし"
+            ]
+
+        return []
+
+    lines: list[str] = []
+
+    for index, candidate in enumerate(
+        candidates,
+        start=1,
+    ):
+
+        lines.append(
+            f"{index}. "
+            f"**{candidate.symbol}**"
+        )
+
+        lines.append(
+            "日足出来高: "
+            f"{format_volume(candidate.quote_volume)}"
+        )
+
+        lines.append("")
+
+    # Discord content上限対策。
+    # 1メッセージ1900文字程度までに分割。
+    chunks: list[str] = []
+
+    current = header
+
+    for line in lines:
+
+        addition = (
+            line + "\n"
+        )
+
+        if (
+            len(current)
+            + len(addition)
+            > 1900
+        ):
+
+            chunks.append(
+                current.rstrip()
+            )
+
+            current = (
+                title
+                + "（続き）\n\n"
+                + addition
+            )
+
+        else:
+            current += addition
+
+    if current.strip():
+        chunks.append(
+            current.rstrip()
+        )
+
+    return chunks
+
+
+# =========================================================
+# Scan
+# =========================================================
+
+async def scan_once(
+    mode: str,
+) -> tuple[
+    list[Candidate],
+    PassCounts,
+]:
+
+    scan_time = jst_now()
+
+    timeout = aiohttp.ClientTimeout(
+        total=REQUEST_TIMEOUT + 10
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
+
+        symbols = await fetch_symbols(
+            session
+        )
+
+        counts = PassCounts(
+            total_symbols=len(
+                symbols
+            )
+        )
+
+        logger.info(
+            "scan start: "
+            "version=%s "
+            "mode=%s "
+            "time=%s "
+            "symbols=%d",
+            VERSION,
+            mode,
+            scan_time.strftime(
+                "%Y-%m-%d "
+                "%H:%M:%S JST"
+            ),
+            len(symbols),
+        )
+
+        semaphore = asyncio.Semaphore(
+            REQUEST_CONCURRENCY
+        )
+
         tasks = [
-            evaluate_one_symbol(session, sem, symbol, counts)
+            evaluate_one_symbol(
+                session,
+                semaphore,
+                symbol,
+                mode,
+                counts,
+            )
             for symbol in symbols
         ]
-        results = await asyncio.gather(*tasks)
 
-        candidates = [result for result in results if result is not None]
+        results = await asyncio.gather(
+            *tasks
+        )
 
-        # 値動きが大きい順、同率なら出来高倍率が大きい順。
+        candidates = [
+            result
+            for result in results
+            if result is not None
+        ]
+
+        # -------------------------------------------------
+        # ユーザー指定:
+        # 出来高の降順
+        # -------------------------------------------------
+
         candidates.sort(
-            key=lambda item: (item.price_rise_pct, item.volume_multiple),
+            key=lambda item:
+                item.quote_volume,
             reverse=True,
         )
 
         logger.info(
-            "pass counts: total=%d enough=%d bullish=%d vol10m=%d vol2x=%d "
-            "rise10pct=%d highest24=%d final=%d failed=%d",
+            "pass counts: "
+            "total=%d "
+            "enough100=%d "
+            "vol20m=%d "
+            "vol2x=%d "
+            "highest30=%d "
+            "aboveMA=%d "
+            "final=%d "
+            "failed=%d",
             counts.total_symbols,
-            counts.enough_closed_klines,
-            counts.bullish,
-            counts.volume_10m,
+            counts.enough_klines,
+            counts.volume_20m,
             counts.volume_2x,
-            counts.price_rise_10pct,
-            counts.highest_close_24,
+            counts.highest_close_30,
+            counts.above_all_ma,
             counts.final_pass,
             counts.kline_failed,
         )
 
-        if not candidates:
-            logger.info("no matched symbols. Discord notification skipped.")
-            return candidates, counts
+        if candidates:
 
-        logger.info("matched=%s", [candidate.symbol for candidate in candidates])
+            logger.info(
+                "matched symbols: %s",
+                [
+                    candidate.symbol
+                    for candidate
+                    in candidates
+                ],
+            )
 
-        for candidate in candidates:
-            # スキャン中にJST 09:00を跨いだ場合も、新しい通知日に切り替える。
-            current_day = notification_day_key()
-            if current_day != state_day:
-                logger.info(
-                    "notification day rolled over during scan: old=%s new=%s",
-                    state_day,
-                    current_day,
-                )
-                state_day = current_day
-                notified_symbols.clear()
+        else:
 
-            # JST 09:00起点の同一通知日で既に通知済みなら送らない。
-            if candidate.symbol in notified_symbols:
-                counts.already_notified += 1
-                logger.info(
-                    "%s already notified in notification_day=%s; skipped",
-                    candidate.symbol,
-                    notification_day_key(),
-                )
-                continue
+            logger.info(
+                "matched symbols: none"
+            )
+
+        messages = (
+            build_message_chunks(
+                candidates,
+                mode,
+                scan_time,
+            )
+        )
+
+        # プレ通知:
+        # 0件ならmessages=[]なので送信しない。
+        #
+        # 本通知:
+        # 0件でも「条件一致なし」が入る。
+        for message in messages:
 
             try:
-                snapshot = await fetch_market_snapshot(
+                await send_discord(
                     session,
-                    candidate.symbol,
-                    candidate.close_time_ms,
+                    message,
                 )
 
-                if (
-                    snapshot.oi_notional_usdt is None
-                    or snapshot.oi_change_1h_pct is None
-                    or snapshot.funding_rate is None
-                ):
-                    counts.market_data_failed += 1
-
-                message = build_discord_message(candidate, snapshot)
-                await send_discord(session, message)
-
-                # 送信処理中に09:00を跨いだ場合は、送信完了時点の通知日に合わせる。
-                sent_day = notification_day_key()
-                if sent_day != state_day:
-                    logger.info(
-                        "notification day rolled over during send: old=%s new=%s",
-                        state_day,
-                        sent_day,
-                    )
-                    state_day = sent_day
-                    notified_symbols.clear()
-
-                # Discord送信成功後にだけ通知済みとして保存する。
-                notified_symbols.add(candidate.symbol)
-                save_notification_state(notified_symbols)
-
-                logger.info(
-                    "%s Discord notified and state saved: day=%s",
-                    candidate.symbol,
-                    notification_day_key(),
-                )
-
-            except Exception as exc:
-                counts.discord_failed += 1
+            except Exception:
                 logger.exception(
-                    "%s notification failed; state was NOT updated: %s",
-                    candidate.symbol,
-                    exc,
+                    "Discord notification "
+                    "failed"
                 )
 
         logger.info(
-            "notification summary: matched=%d already_notified=%d "
-            "market_data_partial=%d discord_failed=%d",
+            "scan finished: "
+            "mode=%s "
+            "matched=%d",
+            mode,
             len(candidates),
-            counts.already_notified,
-            counts.market_data_failed,
-            counts.discord_failed,
         )
 
         return candidates, counts
 
 
-def seconds_until_next_hour(
-    buffer_seconds: int = RUN_BUFFER_SECONDS,
-) -> int:
-    """
-    毎回「次の正時」を計算して待つため、
-    sleep時間を1時間ずつ積み重ねる方式の時刻ずれは起こさない。
-    """
-    now = jst_now()
-    next_hour = now.replace(
+# =========================================================
+# Scheduler
+# =========================================================
+
+def next_scheduled_run(
+    now: Optional[
+        datetime
+    ] = None,
+) -> tuple[
+    datetime,
+    str,
+]:
+
+    current = (
+        now
+        or jst_now()
+    )
+
+    buffer = timedelta(
+        seconds=(
+            DAILY_RUN_BUFFER_SECONDS
+        )
+    )
+
+    # -----------------------------------------------------
+    # 今日 07:30 + buffer
+    # -----------------------------------------------------
+
+    pre_time = current.replace(
+        hour=7,
+        minute=30,
+        second=0,
+        microsecond=0,
+    ) + buffer
+
+    # -----------------------------------------------------
+    # 今日 09:00 + buffer
+    # -----------------------------------------------------
+
+    main_time = current.replace(
+        hour=9,
         minute=0,
         second=0,
         microsecond=0,
-    ) + timedelta(hours=1)
+    ) + buffer
 
-    seconds = int((next_hour - now).total_seconds()) + buffer_seconds
-    return max(1, seconds)
+    possible: list[
+        tuple[datetime, str]
+    ] = []
 
+    if pre_time > current:
+        possible.append(
+            (
+                pre_time,
+                "pre",
+            )
+        )
 
-async def main_loop() -> None:
-    logger.info(
-        "bot started: version=%s time=%s state_file=%s",
-        VERSION,
-        jst_now().strftime("%Y-%m-%d %H:%M:%S JST"),
-        STATE_FILE,
+    if main_time > current:
+        possible.append(
+            (
+                main_time,
+                "main",
+            )
+        )
+
+    if possible:
+
+        possible.sort(
+            key=lambda item:
+                item[0]
+        )
+
+        return possible[0]
+
+    # 今日の2回が終わっている場合は
+    # 翌日の07:30へ。
+    tomorrow = (
+        current
+        + timedelta(days=1)
     )
 
-    while not shutdown_event.is_set():
-        started = time.time()
+    next_pre = tomorrow.replace(
+        hour=7,
+        minute=30,
+        second=0,
+        microsecond=0,
+    ) + buffer
 
-        try:
-            await scan_once()
-        except Exception:
-            logger.exception("scan failed")
+    return (
+        next_pre,
+        "pre",
+    )
 
-        elapsed = time.time() - started
-        sleep_seconds = seconds_until_next_hour()
 
-        logger.info(
-            "scan elapsed %.1f sec. next run in %d seconds",
-            elapsed,
-            sleep_seconds,
+async def wait_until(
+    target: datetime,
+) -> bool:
+    """
+    targetまで待機する。
+
+    shutdown_eventが先にセットされた場合は
+    Falseを返す。
+    """
+
+    while (
+        not shutdown_event.is_set()
+    ):
+
+        seconds = (
+            target
+            - jst_now()
+        ).total_seconds()
+
+        if seconds <= 0:
+            return True
+
+        # 長時間sleepを一度に行わず、
+        # shutdownにも反応できるよう
+        # 最大60秒単位で待つ。
+        timeout = min(
+            seconds,
+            60.0,
         )
 
         try:
             await asyncio.wait_for(
                 shutdown_event.wait(),
-                timeout=sleep_seconds,
+                timeout=timeout,
             )
+
+        except asyncio.TimeoutError:
+            continue
+
+    return False
+
+
+# =========================================================
+# Main loop
+# =========================================================
+
+async def main_loop() -> None:
+
+    logger.info(
+        "bot started: "
+        "version=%s "
+        "time=%s",
+        VERSION,
+        jst_now().strftime(
+            "%Y-%m-%d "
+            "%H:%M:%S JST"
+        ),
+    )
+
+    logger.info(
+        "schedule: "
+        "pre=07:30 JST "
+        "main=09:00 JST "
+        "buffer=%d sec",
+        DAILY_RUN_BUFFER_SECONDS,
+    )
+
+    while (
+        not shutdown_event.is_set()
+    ):
+
+        target_time, mode = (
+            next_scheduled_run()
+        )
+
+        logger.info(
+            "next run: "
+            "mode=%s "
+            "time=%s",
+            mode,
+            target_time.strftime(
+                "%Y-%m-%d "
+                "%H:%M:%S JST"
+            ),
+        )
+
+        should_run = await wait_until(
+            target_time
+        )
+
+        if not should_run:
+            break
+
+        if shutdown_event.is_set():
+            break
+
+        try:
+            await scan_once(
+                mode
+            )
+
+        except Exception:
+            logger.exception(
+                "scan failed: mode=%s",
+                mode,
+            )
+
+        # 現在時刻がtargetと同一秒扱いに
+        # ならないよう少しだけ待つ。
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(),
+                timeout=1.0,
+            )
+
         except asyncio.TimeoutError:
             pass
 
 
+# =========================================================
+# Shutdown
+# =========================================================
+
 def handle_shutdown() -> None:
-    if not shutdown_event.is_set():
-        logger.info("shutdown signal received")
+
+    if (
+        not shutdown_event.is_set()
+    ):
+
+        logger.info(
+            "shutdown signal received"
+        )
+
         shutdown_event.set()
 
 
 async def async_main() -> None:
-    loop = asyncio.get_running_loop()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    loop = (
+        asyncio.get_running_loop()
+    )
+
+    for sig in (
+        signal.SIGINT,
+        signal.SIGTERM,
+    ):
+
         try:
-            loop.add_signal_handler(sig, handle_shutdown)
+            loop.add_signal_handler(
+                sig,
+                handle_shutdown,
+            )
+
         except NotImplementedError:
-            # Windows等ではadd_signal_handlerが未対応の場合がある。
+            # Windows環境等
             pass
 
     await main_loop()
 
 
+# =========================================================
+# Entry point
+# =========================================================
+
 if __name__ == "__main__":
+
     try:
-        asyncio.run(async_main())
+        asyncio.run(
+            async_main()
+        )
+
     except KeyboardInterrupt:
         pass
