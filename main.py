@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 # =========================================================
 # Binance Daily Pump Filter Bot
-# Version: 3.0.0
+# Version: 3.1.0
 #
 # 07:30 JST
 #   プレ通知
@@ -32,8 +32,16 @@ from dotenv import load_dotenv
 #   4. 日足終値 > SMA5 / 10 / 30 / 50 / 100
 #   5. SMA100を計算できない銘柄は除外
 #
+# 通知内容
+#   ・銘柄名
+#   ・日足出来高
+#   ・出来高変化率（前日比）
+#
 # 出来高
 #   Binance kline[7] の Quote Asset Volume（USDT建て）
+#
+# 出来高変化率
+#   (対象日足出来高 / 前日日足出来高 - 1) × 100
 #
 # MA
 #   判定対象の日足自身を含めて計算
@@ -42,7 +50,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 BASE_URL = os.getenv(
     "BINANCE_FAPI_BASE_URL",
@@ -155,6 +163,7 @@ class Candidate:
     close: float
     previous_quote_volume: float
     volume_multiple: float
+    volume_change_pct: float
     open_time_ms: int
     close_time_ms: int
 
@@ -218,6 +227,13 @@ def format_volume(
         )
 
     return f"${value:.2f}"
+
+
+def format_change_pct(
+    value: float,
+) -> str:
+
+    return f"{value:+.1f}%"
 
 
 # =========================================================
@@ -469,8 +485,6 @@ def select_pre_klines(
 
     latest = klines[-1]
 
-    # 最後の足が本当に未確定か確認。
-    #
     # kline[6] = close time
     if int(latest[6]) < now_ms:
         logger.warning(
@@ -557,13 +571,8 @@ def evaluate_symbol(
             f"invalid mode: {mode}"
         )
 
-    # -----------------------------------------------------
     # SMA100を作るため、
     # 判定対象の日足を含めて最低100本必要。
-    #
-    # 新規上場等で100本未満なら除外。
-    # -----------------------------------------------------
-
     if len(usable) < 100:
         return None
 
@@ -593,9 +602,7 @@ def evaluate_symbol(
 
     # -----------------------------------------------------
     # 条件1
-    #
-    # 対象日足のUSDT建て出来高
-    # >= 20,000,000 USDT
+    # 対象日足のUSDT建て出来高 >= 20M USDT
     # -----------------------------------------------------
 
     if (
@@ -608,16 +615,35 @@ def evaluate_symbol(
 
 
     # -----------------------------------------------------
-    # 条件2
-    #
-    # 対象日足出来高
-    # >= 前日日足出来高 × 2
+    # 出来高倍率
     # -----------------------------------------------------
 
     volume_multiple = (
         target_quote_volume
         / previous_quote_volume
     )
+
+
+    # -----------------------------------------------------
+    # 出来高変化率
+    #
+    # 例:
+    # 前日 20M
+    # 当日 50M
+    #
+    # 50 / 20 = 2.5倍
+    # (2.5 - 1) × 100 = +150%
+    # -----------------------------------------------------
+
+    volume_change_pct = (
+        volume_multiple - 1.0
+    ) * 100.0
+
+
+    # -----------------------------------------------------
+    # 条件2
+    # 対象日足出来高 >= 前日日足出来高 × 2
+    # -----------------------------------------------------
 
     if (
         volume_multiple
@@ -632,15 +658,11 @@ def evaluate_symbol(
     # 条件3
     #
     # 対象日足の終値が、
-    # 「対象日足を除いた直前30本」
+    # 対象日足を除いた直前30本
     # すべての終値より高い。
-    #
-    # つまり、
     #
     # target_close
     # > max(previous 30 closes)
-    #
-    # 同値は通過しない。
     # -----------------------------------------------------
 
     previous_30 = (
@@ -675,20 +697,10 @@ def evaluate_symbol(
     # 条件4
     #
     # 対象日足終値が
-    #
-    # SMA5
-    # SMA10
-    # SMA30
-    # SMA50
-    # SMA100
-    #
+    # SMA5 / 10 / 30 / 50 / 100
     # のすべてより上。
     #
     # MA計算には対象日足自身を含む。
-    #
-    # プレ通知では、
-    # 07:30時点の仮終値を使って
-    # 当日日足をMA計算に含める。
     # -----------------------------------------------------
 
     closes = [
@@ -730,6 +742,7 @@ def evaluate_symbol(
         close=target_close,
         previous_quote_volume=previous_quote_volume,
         volume_multiple=volume_multiple,
+        volume_change_pct=volume_change_pct,
         open_time_ms=int(
             target[0]
         ),
@@ -986,10 +999,14 @@ def build_message_chunks(
             f"{format_volume(candidate.quote_volume)}"
         )
 
+        lines.append(
+            "出来高変化率: "
+            f"{format_change_pct(candidate.volume_change_pct)}"
+        )
+
         lines.append("")
 
-    # Discord content上限対策。
-    # 1メッセージ1900文字程度までに分割。
+    # Discord content上限対策
     chunks: list[str] = []
 
     current = header
@@ -1098,11 +1115,7 @@ async def scan_once(
             if result is not None
         ]
 
-        # -------------------------------------------------
-        # ユーザー指定:
         # 出来高の降順
-        # -------------------------------------------------
-
         candidates.sort(
             key=lambda item:
                 item.quote_volume,
@@ -1158,7 +1171,7 @@ async def scan_once(
         # 0件ならmessages=[]なので送信しない。
         #
         # 本通知:
-        # 0件でも「条件一致なし」が入る。
+        # 0件でも「条件一致なし」を送信。
         for message in messages:
 
             try:
@@ -1208,10 +1221,7 @@ def next_scheduled_run(
         )
     )
 
-    # -----------------------------------------------------
     # 今日 07:30 + buffer
-    # -----------------------------------------------------
-
     pre_time = current.replace(
         hour=7,
         minute=30,
@@ -1219,10 +1229,7 @@ def next_scheduled_run(
         microsecond=0,
     ) + buffer
 
-    # -----------------------------------------------------
     # 今日 09:00 + buffer
-    # -----------------------------------------------------
-
     main_time = current.replace(
         hour=9,
         minute=0,
@@ -1301,9 +1308,6 @@ async def wait_until(
         if seconds <= 0:
             return True
 
-        # 長時間sleepを一度に行わず、
-        # shutdownにも反応できるよう
-        # 最大60秒単位で待つ。
         timeout = min(
             seconds,
             60.0,
@@ -1386,8 +1390,6 @@ async def main_loop() -> None:
                 mode,
             )
 
-        # 現在時刻がtargetと同一秒扱いに
-        # ならないよう少しだけ待つ。
         try:
             await asyncio.wait_for(
                 shutdown_event.wait(),
@@ -1433,7 +1435,6 @@ async def async_main() -> None:
             )
 
         except NotImplementedError:
-            # Windows環境等
             pass
 
     await main_loop()
