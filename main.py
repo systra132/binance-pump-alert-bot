@@ -1,6 +1,6 @@
 """Binance USDT perpetual futures: confirmed 1h short reversal WATCH Bot.
 
-Version 3.0.0. Notifications only; no trades, CSV or persistent state.
+Version 3.0.1. Notifications only; no trades, CSV or persistent state.
 Dependencies: aiohttp, python-dotenv (existing requirements.txt).
 """
 import asyncio
@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 BASE_URL = os.getenv("BINANCE_FAPI_BASE_URL", "https://fapi.binance.com").rstrip("/")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 REQUEST_CONCURRENCY = max(1, int(os.getenv("REQUEST_CONCURRENCY", "8")))
@@ -33,6 +33,7 @@ MIN_OI_RISE_PCT = 5.0
 MIN_UPPER_WICK_BODY = 1.0
 HIGH_LOOKBACK = 24
 VOLUME_LOOKBACK = 24
+VOLUME_BOTTOM_COUNT = 12
 OI_LOOKBACK = 24
 MA_PERIODS = (5, 10, 30, 50, 100)
 KLINE_LIMIT = 130
@@ -198,7 +199,9 @@ def evaluate_klines(symbol: str, klines: list, target_boundary_ms: int) -> Kline
     volume = volumes[-1]
     if volume < MIN_VOLUME_USDT:
         return None
-    base = sum(volumes[-(VOLUME_LOOKBACK + 1):-1]) / VOLUME_LOOKBACK
+    # Exclude the target bar; average the 12 lowest quote volumes of the prior 24 confirmed bars.
+    previous_volumes = volumes[-(VOLUME_LOOKBACK + 1):-1]
+    base = sum(sorted(previous_volumes)[:VOLUME_BOTTOM_COUNT]) / VOLUME_BOTTOM_COUNT
     if base <= 0:
         return None
     volume_multiple = volume / base
@@ -312,7 +315,7 @@ def discord_payload(a: Alert) -> dict:
                 {"name": "高値順位", "value": f"{c.high_rank}位 / 24本", "inline": True},
                 {"name": "上ヒゲ / 実体", "value": f"{c.wick_body_pct:.1f}%", "inline": True},
                 {"name": "出来高", "value": human_usdt(c.quote_volume), "inline": True},
-                {"name": "出来高倍率", "value": f"{c.volume_multiple:.2f}倍", "inline": True},
+                {"name": "出来高倍率（直前24本の下位12本平均比）", "value": f"{c.volume_multiple:.2f}倍", "inline": True},
                 {"name": "FR（取得時点）", "value": f"{a.funding_rate * 100:+.4f}%", "inline": True},
                 {"name": "OI総額", "value": human_usdt(a.oi_usdt), "inline": True},
                 {"name": "24h最低OI比（数量）", "value": f"{a.oi_min_rise_pct:+.2f}%", "inline": True},
